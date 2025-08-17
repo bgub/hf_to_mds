@@ -27,7 +27,7 @@ import signal
 import argparse
 import multiprocessing as mp
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Iterable, List
 
 from datasets import load_dataset
 from huggingface_hub import HfApi
@@ -35,6 +35,14 @@ from tqdm import tqdm
 
 from streaming import MDSWriter
 from streaming.base.util import merge_index
+
+# Optional imports for fallback parquet iteration
+try:
+    from datasets.filesystems import HfFileSystem  # type: ignore
+    import pyarrow.parquet as pq  # type: ignore
+except Exception:  # pragma: no cover - optional during import
+    HfFileSystem = None  # type: ignore
+    pq = None  # type: ignore
 
 IS_DARWIN = sys.platform == "darwin"
 
@@ -173,34 +181,169 @@ def _make_writer(opts: WriterOpts) -> MDSWriter:
 def _producer(
     rank: int,
     world: int,
-    q: mp.Queue,
-    stop: mp.Value,
+    q: Any,
+    stop: Any,
     repo_id: str,
     config: Optional[str],
     split: str,
     revision: Optional[str],
 ):
-    ds = load_dataset(repo_id, config, split=split, revision=revision, streaming=True)
-    # Guard sharding: tiny configs may not have enough sources for all ranks.
+    """Stream examples from HF. On schema cast errors, fall back to direct Parquet iteration.
+
+    The fallback enumerates Parquet files under data/<config>/<split>/ on the Hub and yields
+    rows without casting, allowing extra columns to be ignored downstream.
+    """
     try:
-        part = ds.shard(num_shards=world, index=rank)
-    except Exception:
-        # If this rank would be empty, exit early; let rank 0 process the whole stream.
-        if rank != 0:
+        ds = load_dataset(
+            repo_id, config, split=split, revision=revision, streaming=True
+        )
+        # Guard sharding: tiny configs may not have enough sources for all ranks.
+        try:
+            part = ds.shard(num_shards=world, index=rank)
+        except Exception:
+            # If this rank would be empty, exit early; let rank 0 process the whole stream.
+            if rank != 0:
+                q.put(None)
+                return
+            part = ds
+
+        for ex in part:
+            if stop.value:
+                break
+            q.put(ex)
+        q.put(None)  # sentinel
+        return
+    except Exception as e:
+        # CastError from datasets when file columns don't match the dataset features.
+        # We detect broadly and switch to a robust fallback.
+        msg = str(e)
+        cast_error = (
+            "CastError" in msg
+            or "Couldn't cast" in msg
+            or "column names don't match" in msg
+        )
+        if not cast_error:
+            # Unknown error; propagate to terminate this worker but keep others alive.
             q.put(None)
             return
-        part = ds
 
-    for ex in part:
+    # Fallback: direct Parquet iteration via HfFileSystem + pyarrow
+    print(
+        "Note: schema mismatch while streaming; falling back to direct Parquet read.",
+        flush=True,
+    )
+    if HfFileSystem is None or pq is None:
+        # Required optional deps not available; give up cleanly.
+        q.put(None)
+        return
+
+    try:
+        _producer_parquet_fallback(
+            rank=rank,
+            world=world,
+            q=q,
+            stop=stop,
+            repo_id=repo_id,
+            config=config,
+            split=split,
+            revision=revision,
+        )
+    finally:
+        q.put(None)
+
+
+def _list_parquet_files(
+    api: HfApi, repo_id: str, config: Optional[str], split: str, revision: Optional[str]
+) -> List[str]:
+    """List parquet file paths in the repo for a given config/split.
+
+    Returns repo-relative paths like 'data/<config>/<split>/000_00000.parquet'.
+    """
+    # Common HF layout used by parquet exports
+    search_paths: List[str] = []
+    if config:
+        search_paths.append(f"data/{config}/{split}/")
+    # Some datasets might place split directly under data/
+    search_paths.append(f"data/{split}/")
+
+    files: List[str] = []
+    for p in search_paths:
+        try:
+            files_in_path = api.list_repo_files(
+                repo_id=repo_id, repo_type="dataset", paths=[p], revision=revision
+            )
+        except Exception:
+            files_in_path = []
+        for f in files_in_path:
+            if f.endswith(".parquet") and "/_temporary/" not in f:
+                files.append(f)
+    # Stable ordering for deterministic sharding
+    files.sort()
+    return files
+
+
+def _producer_parquet_fallback(
+    rank: int,
+    world: int,
+    q: Any,
+    stop: Any,
+    repo_id: str,
+    config: Optional[str],
+    split: str,
+    revision: Optional[str],
+    read_batch_size: int = 4096,
+) -> None:
+    """Fallback producer that reads parquet files directly to avoid schema casts.
+
+    It shards the list of files across workers (by index mod world) and streams rows.
+    Only columns required by the consumer will be kept downstream, so extra columns are fine.
+    """
+    api = HfApi()
+    files = _list_parquet_files(api, repo_id, config, split, revision)
+    if not files:
+        return
+
+    # Build base hf:// path with optional revision pin
+    base = f"hf://datasets/{repo_id}"
+    if revision:
+        base = f"{base}@{revision}"
+
+    fs = HfFileSystem()
+
+    for idx, rel_path in enumerate(files):
         if stop.value:
             break
-        q.put(ex)
-    q.put(None)  # sentinel
+        if (idx % world) != rank:
+            continue
+        hf_path = f"{base}/{rel_path}"
+        try:
+            with fs.open(hf_path, "rb") as fobj:
+                parquet = pq.ParquetFile(fobj)
+                num_row_groups = parquet.num_row_groups
+                for rg in range(num_row_groups):
+                    if stop.value:
+                        break
+                    table = parquet.read_row_group(rg)
+                    # Stream rows in manageable chunks to avoid large memory spikes
+                    num_rows = table.num_rows
+                    start = 0
+                    while start < num_rows and not stop.value:
+                        end = min(start + read_batch_size, num_rows)
+                        batch = table.slice(start, end - start)
+                        for row in batch.to_pylist():
+                            if stop.value:
+                                break
+                            # Emit raw row; consumer will select expected columns
+                            q.put(row)
+                        start = end
+        except Exception:
+            # Skip unreadable file and continue
+            continue
 
 
 def _consumer_writer(
-    q: mp.Queue,
-    stop: mp.Value,
+    q: Any,
+    stop: Any,
     opts: WriterOpts,
     expected_total: Optional[int] = None,
     upload_during: bool = False,
