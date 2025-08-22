@@ -17,7 +17,7 @@ python batch_to_mds.py \
   --src wikimedia/wikipedia \
   --out-hub bgub/wikipedia-mds-test \
   --out-local ./mds-local-2/wikipedia \
-  --procs 10
+  --max-workers 16
 ```
 
 **Convert single config/split:**
@@ -37,7 +37,9 @@ python hf_to_mds_streaming.py \
 **`batch_to_mds.py`** - Batch convert all configs/splits:
 
 - `--src` / `--out-hub`: Source and destination repos (required)
-- `--procs`: Worker processes (default: 16)
+- `--max-workers`: Total worker processes available
+- `--max-workers-per-job`: Cap workers for any single subset
+- `--records-per-worker`: Heuristic to size jobs
 - `--compression`: e.g., `zstd`, `zstd:11`
 - `--include-config` / `--exclude-config`: Regex filters
 - `--dry-run`: Preview without executing
