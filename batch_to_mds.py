@@ -53,7 +53,9 @@ def main():
         "--size-limit", default=None, help="e.g., 67mb, 256mb (omit for default)"
     )
     ap.add_argument(
-        "--compression", default=None, help="e.g., zstd or zstd:11 (omit for none)"
+        "--compression",
+        default="zstd",
+        help="Compression for shards (e.g., zstd or zstd:11). Use 'none' to disable.",
     )
     ap.add_argument(
         "--include-config", default=r".*", help="Regex filter for configs (subsets)"
@@ -113,7 +115,10 @@ def main():
         if args.size_limit:
             cmd += ["--size-limit", args.size_limit]
         if args.compression:
-            cmd += ["--compression", args.compression]
+            cmd += [
+                "--compression",
+                ("none" if str(args.compression).lower() == "none" else args.compression),
+            ]
         return cmd
 
     total_jobs = 0

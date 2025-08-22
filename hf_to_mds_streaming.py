@@ -426,7 +426,11 @@ def main():
 
     ap.add_argument("--procs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
 
-    ap.add_argument("--compression", default=None)
+    ap.add_argument(
+        "--compression",
+        default="zstd",
+        help="Compression codec for shards (e.g., zstd or zstd:11). Use 'none' to disable.",
+    )
     ap.add_argument(
         "--size-limit",
         default=None,
@@ -528,7 +532,11 @@ def main():
         out_local=local_split_root,
         out_remote=remote_split_root,
         columns=columns,
-        compression=args.compression,
+        compression=(
+            None
+            if (args.compression is None or str(args.compression).lower() == "none")
+            else args.compression
+        ),
         size_limit=args.size_limit,
         upload_threads=args.upload_threads,
         hash_alg=(
