@@ -37,7 +37,8 @@ python hf_to_mds_streaming.py \
 **`batch_to_mds.py`** - Batch convert all configs/splits:
 
 - `--src` / `--out-hub`: Source and destination repos (required)
-- `--procs`: Worker processes (default: 16)
+- `--procs`: Total worker processes across all subsets; jobs run concurrently (default: 16)
+- `--records-per-proc`: Approximate records per worker when sizing each job (default: 1,000,000)
 - `--compression`: e.g., `zstd`, `zstd:11`
 - `--include-config` / `--exclude-config`: Regex filters
 - `--dry-run`: Preview without executing
