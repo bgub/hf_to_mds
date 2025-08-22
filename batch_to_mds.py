@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
 # pip install datasets huggingface_hub
-import os, re, shutil, subprocess, sys, time
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
 from argparse import ArgumentParser
-from typing import List
-from datasets import get_dataset_config_names, get_dataset_split_names
+from collections import deque
+from dataclasses import dataclass
+from typing import Deque, List, Tuple
+
+from datasets import (
+    get_dataset_config_info,
+    get_dataset_config_names,
+    get_dataset_split_names,
+)
 from huggingface_hub import HfApi
 
 
@@ -44,7 +56,16 @@ def main():
         help="Path to the converter script you put in the canvas",
     )
     ap.add_argument(
-        "--procs", type=int, default=16, help="# workers passed to converter"
+        "--max-workers", type=int, default=16, help="Total workers across all jobs"
+    )
+    ap.add_argument(
+        "--max-workers-per-job", type=int, default=8, help="Worker cap per job"
+    )
+    ap.add_argument(
+        "--records-per-worker",
+        type=int,
+        default=500_000,
+        help="Approximate records handled by each worker",
     )
     ap.add_argument(
         "--hash", default="xxh64", help="xxh64 | sha1 | none (passed to converter)"
@@ -88,8 +109,25 @@ def main():
     cfgs = [c for c in cfgs if inc_cfg.search(str(c)) and not exc_cfg.search(str(c))]
     print(f"Found {len(cfgs)} configs after filtering.")
 
+    @dataclass
+    class Job:
+        cfg: str
+        split: str
+        procs: int
+
+    def estimate_workers(cfg: str, split: str) -> int:
+        try:
+            info = get_dataset_config_info(args.src, cfg)
+            n = int(info.splits[split].num_examples)  # type: ignore
+        except Exception:
+            n = 0
+        if n <= 0:
+            return 1
+        need = n // args.records_per_worker + 1
+        return min(args.max_workers_per_job, max(1, need))
+
     # Helper to build converter cmd
-    def converter_cmd(cfg: str, split: str) -> List[str]:
+    def converter_cmd(cfg: str, split: str, procs: int) -> List[str]:
         cmd = [
             sys.executable,
             args.converter,
@@ -104,9 +142,9 @@ def main():
             "--out-hub",
             args.out_hub,
             "--dest-subdir",
-            cfg,  # mirror config name
+            cfg,
             "--procs",
-            str(args.procs),
+            str(procs),
             "--streaming",
             "--upload-after",
             "--hash",
@@ -121,9 +159,9 @@ def main():
             ]
         return cmd
 
-    total_jobs = 0
+    jobs: Deque[Job] = deque()
+
     for cfg in cfgs:
-        # Enumerate splits for this config
         try:
             splits = get_dataset_split_names(args.src, cfg)
         except Exception as e:
@@ -136,46 +174,60 @@ def main():
             continue
 
         for split in splits:
-            total_jobs += 1
             print(f"\n=== {args.src} | {cfg} | {split} ===")
             if not args.force and hub_has_index(api, args.out_hub, cfg, split):
                 print("✓ Skip — already on Hub.")
                 continue
+            procs = estimate_workers(cfg, split)
+            jobs.append(Job(cfg, split, procs))
 
-            cmd = converter_cmd(cfg, split)
-            if args.dry_run:
-                print("DRY RUN:", " ".join(cmd))
+    if args.dry_run:
+        for job in jobs:
+            cmd = converter_cmd(job.cfg, job.split, job.procs)
+            print("DRY RUN:", " ".join(cmd))
+        print(f"\nDone. Processed {len(jobs)} job(s).")
+        return
+
+    running: List[Tuple[subprocess.Popen, Job]] = []
+    available = args.max_workers
+    total_jobs = len(jobs)
+
+    while jobs or running:
+        while jobs and jobs[0].procs <= available:
+            job = jobs.popleft()
+            cmd = converter_cmd(job.cfg, job.split, job.procs)
+            print(" ".join(cmd), flush=True)
+            p = subprocess.Popen(cmd)
+            running.append((p, job))
+            available -= job.procs
+
+        time.sleep(args.sleep)
+
+        for proc, job in list(running):
+            rc = proc.poll()
+            if rc is None:
                 continue
-
-            rc = run(cmd)
+            running.remove((proc, job))
+            available += job.procs
             if rc != 0:
-                print(f"✗ Failed ({rc}). Keeping local files for inspection.")
+                print(
+                    f"✗ {job.cfg}/{job.split} failed ({rc}). Keeping local files for inspection."
+                )
                 continue
-
-            # Verify upload then delete local artifacts for this cfg/split
-            # if hub_has_index(api, args.out_hub, cfg, split):
-            if True:
-                if not args.no_delete:
-                    local_dir = os.path.join(
-                        args.out_local,
-                        cfg,
-                        split.rsplit("/", 1)[0] if "/" in split else "",
-                        split,
-                    )
-                    # More robust: nuke the whole config directory for this run
-                    local_cfg_dir = os.path.join(args.out_local, cfg)
-                    target = (
-                        local_cfg_dir if os.path.isdir(local_cfg_dir) else local_dir
-                    )
-                    try:
-                        shutil.rmtree(target)
-                        print(f"🧹 Deleted local {target}")
-                    except Exception as e:
-                        print(f"Warning: could not delete {target}: {e}")
-            else:
-                print("Warning: index.json not found on Hub; not deleting local copy.")
-
-            time.sleep(args.sleep)
+            if not args.no_delete:
+                local_dir = os.path.join(
+                    args.out_local,
+                    job.cfg,
+                    job.split.rsplit("/", 1)[0] if "/" in job.split else "",
+                    job.split,
+                )
+                local_cfg_dir = os.path.join(args.out_local, job.cfg)
+                target = local_cfg_dir if os.path.isdir(local_cfg_dir) else local_dir
+                try:
+                    shutil.rmtree(target)
+                    print(f"🧹 Deleted local {target}")
+                except Exception as e:
+                    print(f"Warning: could not delete {target}: {e}")
 
     print(f"\nDone. Processed {total_jobs} job(s).")
 
